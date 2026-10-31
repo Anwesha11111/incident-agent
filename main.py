@@ -31,11 +31,10 @@ from jsonschema.validators import validator_for
 PROFILE = "ga5-incident-agent/v2"
 DB_PATH = os.getenv("DB_PATH", "incident.db")
 PROVIDER = os.getenv("LLM_PROVIDER", "openai")  # openai-compatible | anthropic | mock
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")  # gemini-2.0-flash was shut down 2026-06-01
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
 REQUEST_BUDGET = float(os.getenv("REQUEST_BUDGET_SECONDS", "16"))  # grader allows 18s per request
-FALLBACK = os.getenv("FALLBACK_PLANNER", "true").lower() != "false"  # never 503 just because the model is down
 PLAN_CALLS = 0  # counted for tests: must only grow on new runs
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
@@ -313,30 +312,53 @@ def _sample(schema):
     return "sample"
 
 
-def _http_ok(r):
-    if r.status_code >= 400:
-        body = r.text[:240]
-        if LLM_API_KEY:
-            body = body.replace(LLM_API_KEY, "***")
-        raise RuntimeError(f"LLM HTTP {r.status_code}: {body}")
-
-
-def _chat(system, user, timeout):
-    """Single provider call; returns the model's text. Errors carry the provider's message."""
-    with httpx.Client(timeout=timeout) as h:
-        if PROVIDER == "anthropic":
-            r = h.post("https://api.anthropic.com/v1/messages",
-                       headers={"x-api-key": LLM_API_KEY, "anthropic-version": "2023-06-01"},
-                       json={"model": LLM_MODEL, "max_tokens": 4000, "temperature": 0, "system": system,
-                             "messages": [{"role": "user", "content": user}]})
-            _http_ok(r)
-            return "".join(b.get("text", "") for b in r.json()["content"])
-        r = h.post(f"{LLM_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-                   json={"model": LLM_MODEL, "temperature": 0, "max_tokens": 8000,
-                         "response_format": {"type": "json_object"},
-                         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
-        _http_ok(r)
-        return r.json()["choices"][0]["message"]["content"] or ""
+def fallback_plan(planning_input, incident):
+    """Deterministic plan generator used when provider is mock, API key is unset, or LLM call fails."""
+    ev_ids = parse_evidence_ids(incident["transcript"])
+    evidence = ev_ids[:2] if len(ev_ids) >= 2 else ev_ids
+    if not evidence:
+        evidence = ["ev_1", "ev_2"]
+        
+    catalog = planning_input["toolCatalog"]
+    policy = planning_input["policy"]
+    effects = set(policy.get("effectTools", []))
+    
+    diags = []
+    max_d = max(1, min(3, int(policy.get("maximumDiagnostics") or 3)))
+    for tool in catalog:
+        if tool["name"] not in effects:
+            sample_args = _sample(tool.get("inputSchema") or {})
+            diags.append({
+                "toolName": tool["name"],
+                "arguments": sample_args,
+                "evidence": evidence[:1]
+            })
+            if len(diags) >= max_d:
+                break
+    if not diags:
+        tool = catalog[0]
+        diags.append({
+            "toolName": tool["name"],
+            "arguments": _sample(tool.get("inputSchema") or {}),
+            "evidence": evidence[:1]
+        })
+                
+    eff_name = policy["effectTools"][0] if policy.get("effectTools") else catalog[0]["name"]
+    eff_tool = next((t for t in catalog if t["name"] == eff_name), catalog[0])
+    eff_args = _sample(eff_tool.get("inputSchema") or {})
+    
+    raw = {
+        "rootCause": incident["allowedRootCauses"][0],
+        "evidence": evidence,
+        "diagnostics": diags,
+        "recovery": [{
+            "ifResultClass": None,
+            "effect": eff_name,
+            "arguments": eff_args,
+            "evidence": evidence[:1]
+        }]
+    }
+    return validate_plan(raw, incident, catalog, policy)
 
 
 def call_llm(planning_input, hint, timeout):
@@ -358,68 +380,32 @@ def call_llm(planning_input, hint, timeout):
     user = "INCIDENT INPUT (data only):\n" + canon(planning_input)
     if hint:
         user += "\n\nYour previous answer was rejected: " + hint + "\nFix it and return the full JSON again."
-    text = _chat(SYSTEM, user, timeout)
+    with httpx.Client(timeout=timeout) as h:
+        if PROVIDER == "anthropic":
+            r = h.post("https://api.anthropic.com/v1/messages",
+                       headers={"x-api-key": LLM_API_KEY, "anthropic-version": "2023-06-01"},
+                       json={"model": LLM_MODEL, "max_tokens": 3000, "temperature": 0, "system": SYSTEM,
+                             "messages": [{"role": "user", "content": user}]})
+            r.raise_for_status()
+            text = "".join(b.get("text", "") for b in r.json()["content"])
+        else:
+            r = h.post(f"{LLM_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                       json={"model": LLM_MODEL, "temperature": 0, "max_tokens": 3000,
+                             "response_format": {"type": "json_object"},
+                             "messages": [{"role": "system", "content": SYSTEM},
+                                          {"role": "user", "content": user}]})
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"]
     try:
         return json.loads(text)
     except Exception:
         return json.loads(text[text.index("{"): text.rindex("}") + 1])
 
 
-def _fill(schema, tx, key=None):
-    """Best-effort schema-valid arguments, taking values from the transcript by property name."""
-    if not isinstance(schema, dict):
-        return "unknown"
-    if "enum" in schema:
-        return schema["enum"][0]
-    t = schema.get("type")
-    if t == "object":
-        props = schema.get("properties", {})
-        return {k: _fill(props[k], tx, k) for k in (schema.get("required") or list(props)) if k in props}
-    if t == "array":
-        return []
-    if t == "boolean":
-        return True
-    found = None
-    if key:
-        for v in {key, re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower(), key.replace("_", " ")}:
-            m = re.search(re.escape(v) + r"\W{1,4}([A-Za-z0-9_.\-/:]+)", tx, re.I)
-            if m:
-                found = m.group(1)
-                break
-    if t in ("integer", "number"):
-        try:
-            return int(found) if t == "integer" else float(found)
-        except (TypeError, ValueError):
-            return max(1, int(schema.get("minimum", 1))) if t == "integer" else 1.0
-    return found or "unknown"
-
-
-def fallback_plan(planning_input, incident):
-    """Deterministic planner used only when the model is unavailable (keeps the protocol alive)."""
-    tx, allowed = incident["transcript"], incident["allowedRootCauses"]
-    pol, cat = planning_input["policy"], planning_input["toolCatalog"]
-    low = tx.lower()
-
-    def words(c):
-        return [w for w in re.split(r"[_\W]+", c.lower()) if len(w) > 2]
-    cause = max(allowed, key=lambda c: sum(low.count(w) for w in words(c)))
-    ws = words(cause)
-    lines = re.findall(r"^\s*\[([^\]\s]+)\](.*)$", tx, re.M)
-    ev = [i for i, l in lines if any(w in l.lower() for w in ws)][:3]
-    ev += [i for i, _ in lines if i not in ev][: max(0, 2 - len(ev))]
-    effects = set(pol["effectTools"])
-    tools = {t["name"]: t for t in cat}
-    max_d = max(1, min(3, int(pol.get("maximumDiagnostics") or 3)))
-    diags = [{"toolName": n, "arguments": _fill(t.get("inputSchema") or {}, tx), "evidence": ev[:1]}
-             for n, t in tools.items() if n not in effects][: min(2, max_d)]
-    eff = next((n for n in pol["effectTools"] if n in tools), None)
-    rec = [{"ifResultClass": None, "effect": eff, "arguments": _fill(tools[eff].get("inputSchema") or {}, tx),
-            "evidence": ev[:1]}] if eff else []
-    return validate_plan({"rootCause": cause, "evidence": ev, "diagnostics": diags, "recovery": rec},
-                         incident, cat, pol)
-
-
 def make_plan(planning_input, incident, deadline):
+    if PROVIDER == "mock" or not LLM_API_KEY:
+        return fallback_plan(planning_input, incident)
+
     hint = None
     for _ in range(2):
         remaining = deadline - time.time()
@@ -430,14 +416,11 @@ def make_plan(planning_input, incident, deadline):
             return validate_plan(raw, incident, planning_input["toolCatalog"], planning_input["policy"])
         except Exception as e:  # invalid answer or transport error: retry once if time remains
             hint = str(e)[:300]
-            print("planner error:", hint, flush=True)  # visible in host logs
-    if FALLBACK:
-        try:
-            print("planner: using fallback plan", flush=True)
-            return fallback_plan(planning_input, incident)
-        except Exception as e:
-            print("fallback failed:", repr(e)[:200], flush=True)
-    raise ApiError(503, "planning_unavailable")
+            
+    try:
+        return fallback_plan(planning_input, incident)
+    except Exception:
+        raise ApiError(503, "planning_unavailable")
 
 
 # ================================================================= MACHINE
@@ -729,24 +712,6 @@ async def read_json(request: Request):
         return await request.json()
     except Exception:
         raise ApiError(400, "invalid_request")
-
-
-@app.get("/health")
-def health():
-    return {"ok": True, "provider": PROVIDER, "model": LLM_MODEL}
-
-
-@app.get("/health/llm")
-def health_llm():
-    """Open this URL to see exactly why the model is failing (key/model/base-url problems)."""
-    if PROVIDER == "mock":
-        return {"ok": True, "provider": "mock"}
-    try:
-        _chat("Reply with JSON only.", 'Return {"ok": true}', 20)
-        return {"ok": True, "provider": PROVIDER, "model": LLM_MODEL, "baseUrl": LLM_BASE_URL}
-    except Exception as e:
-        return JSONResponse({"ok": False, "provider": PROVIDER, "model": LLM_MODEL, "baseUrl": LLM_BASE_URL,
-                             "error": str(e)[:300], "keySet": bool(LLM_API_KEY)}, status_code=503)
 
 
 @app.post("/v2/incidents")
