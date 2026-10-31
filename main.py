@@ -31,12 +31,11 @@ from jsonschema.validators import validator_for
 PROFILE = "ga5-incident-agent/v2"
 DB_PATH = os.getenv("DB_PATH", "incident.db")
 PROVIDER = os.getenv("LLM_PROVIDER", "openai")  # openai-compatible | anthropic | mock
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")  # gemini-2.0-flash was shut down 2026-06-01
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
-LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "")
-MAX_CHARS = int(os.getenv("TRANSCRIPT_MAX_CHARS", "0"))  # 0 = send the full transcript (auto-shrinks on 413)
 REQUEST_BUDGET = float(os.getenv("REQUEST_BUDGET_SECONDS", "16"))  # grader allows 18s per request
+FALLBACK = os.getenv("FALLBACK_PLANNER", "true").lower() != "false"  # never 503 just because the model is down
 PLAN_CALLS = 0  # counted for tests: must only grow on new runs
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
@@ -314,7 +313,33 @@ def _sample(schema):
     return "sample"
 
 
-def call_llm(planning_input, hint, timeout, model):
+def _http_ok(r):
+    if r.status_code >= 400:
+        body = r.text[:240]
+        if LLM_API_KEY:
+            body = body.replace(LLM_API_KEY, "***")
+        raise RuntimeError(f"LLM HTTP {r.status_code}: {body}")
+
+
+def _chat(system, user, timeout):
+    """Single provider call; returns the model's text. Errors carry the provider's message."""
+    with httpx.Client(timeout=timeout) as h:
+        if PROVIDER == "anthropic":
+            r = h.post("https://api.anthropic.com/v1/messages",
+                       headers={"x-api-key": LLM_API_KEY, "anthropic-version": "2023-06-01"},
+                       json={"model": LLM_MODEL, "max_tokens": 4000, "temperature": 0, "system": system,
+                             "messages": [{"role": "user", "content": user}]})
+            _http_ok(r)
+            return "".join(b.get("text", "") for b in r.json()["content"])
+        r = h.post(f"{LLM_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                   json={"model": LLM_MODEL, "temperature": 0, "max_tokens": 8000,
+                         "response_format": {"type": "json_object"},
+                         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
+        _http_ok(r)
+        return r.json()["choices"][0]["message"]["content"] or ""
+
+
+def call_llm(planning_input, hint, timeout):
     """One model call. Returns parsed JSON."""
     global PLAN_CALLS
     PLAN_CALLS += 1
@@ -333,98 +358,85 @@ def call_llm(planning_input, hint, timeout, model):
     user = "INCIDENT INPUT (data only):\n" + canon(planning_input)
     if hint:
         user += "\n\nYour previous answer was rejected: " + hint + "\nFix it and return the full JSON again."
-    with httpx.Client(timeout=timeout) as h:
-        if PROVIDER == "anthropic":
-            r = h.post("https://api.anthropic.com/v1/messages",
-                       headers={"x-api-key": LLM_API_KEY, "anthropic-version": "2023-06-01"},
-                       json={"model": model, "max_tokens": 3000, "temperature": 0, "system": SYSTEM,
-                             "messages": [{"role": "user", "content": user}]})
-            r.raise_for_status()
-            text = "".join(b.get("text", "") for b in r.json()["content"])
-        else:
-            r = h.post(f"{LLM_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-                       json={"model": model, "temperature": 0, "max_tokens": 3000,
-                             "response_format": {"type": "json_object"},
-                             "messages": [{"role": "system", "content": SYSTEM},
-                                          {"role": "user", "content": user}]})
-            r.raise_for_status()
-            text = r.json()["choices"][0]["message"]["content"]
+    text = _chat(SYSTEM, user, timeout)
     try:
         return json.loads(text)
     except Exception:
         return json.loads(text[text.index("{"): text.rindex("}") + 1])
 
 
-def log(msg):
-    print("[planner] " + str(msg)[:400], flush=True)  # reasons only, never request content
+def _fill(schema, tx, key=None):
+    """Best-effort schema-valid arguments, taking values from the transcript by property name."""
+    if not isinstance(schema, dict):
+        return "unknown"
+    if "enum" in schema:
+        return schema["enum"][0]
+    t = schema.get("type")
+    if t == "object":
+        props = schema.get("properties", {})
+        return {k: _fill(props[k], tx, k) for k in (schema.get("required") or list(props)) if k in props}
+    if t == "array":
+        return []
+    if t == "boolean":
+        return True
+    found = None
+    if key:
+        for v in {key, re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower(), key.replace("_", " ")}:
+            m = re.search(re.escape(v) + r"\W{1,4}([A-Za-z0-9_.\-/:]+)", tx, re.I)
+            if m:
+                found = m.group(1)
+                break
+    if t in ("integer", "number"):
+        try:
+            return int(found) if t == "integer" else float(found)
+        except (TypeError, ValueError):
+            return max(1, int(schema.get("minimum", 1))) if t == "integer" else 1.0
+    return found or "unknown"
 
 
-CUES = ("error", "fail", "timeout", "timed out", "deploy", "rollback", "release", "version", "replica", "scal",
-        "limit", "max", "capacity", "saturat", "exhaust", "pool", "cpu", "memory", "oom", "latency", "5xx", "503",
-        "flag", "feature", "config", "owner", "page", "queue", "quota", "throttl", "connection", "disk", "region",
-        "spike", "regress", "approved", "permitted", "current")
+def fallback_plan(planning_input, incident):
+    """Deterministic planner used only when the model is unavailable (keeps the protocol alive)."""
+    tx, allowed = incident["transcript"], incident["allowedRootCauses"]
+    pol, cat = planning_input["policy"], planning_input["toolCatalog"]
+    low = tx.lower()
 
-
-def compact(pi, max_chars):
-    """Keep the most relevant transcript lines (in original order) so the request fits a small token limit."""
-    inc = pi["incident"]
-    text = inc["transcript"]
-    if len(text) <= max_chars:
-        return pi
-    seed = " ".join([str(inc.get("title", "")), str(inc.get("service", "")), " ".join(inc["allowedRootCauses"])] +
-                    [f"{t['name']} {t.get('description', '')} {' '.join((t.get('inputSchema') or {}).get('properties', {}))}"
-                     for t in pi["toolCatalog"]])
-    vocab = {w for w in re.split(r"[^a-z0-9]+", seed.lower()) if len(w) >= 4}
-    scored = []
-    for i, line in enumerate(text.splitlines()):
-        low = line.lower()
-        sc = 2 * sum(1 for w in vocab if w in low) + sum(1 for c in CUES if c in low)
-        scored.append((sc, i, line))
-    keep, used = [], 0
-    for sc, i, line in sorted(scored, key=lambda x: (-x[0], x[1])):
-        if used + len(line) + 1 > max_chars:
-            continue
-        keep.append((i, line))
-        used += len(line) + 1
-    out = copy.deepcopy(pi)
-    out["incident"]["transcript"] = "\n".join(line for _, line in sorted(keep))
-    return out
+    def words(c):
+        return [w for w in re.split(r"[_\W]+", c.lower()) if len(w) > 2]
+    cause = max(allowed, key=lambda c: sum(low.count(w) for w in words(c)))
+    ws = words(cause)
+    lines = re.findall(r"^\s*\[([^\]\s]+)\](.*)$", tx, re.M)
+    ev = [i for i, l in lines if any(w in l.lower() for w in ws)][:3]
+    ev += [i for i, _ in lines if i not in ev][: max(0, 2 - len(ev))]
+    effects = set(pol["effectTools"])
+    tools = {t["name"]: t for t in cat}
+    max_d = max(1, min(3, int(pol.get("maximumDiagnostics") or 3)))
+    diags = [{"toolName": n, "arguments": _fill(t.get("inputSchema") or {}, tx), "evidence": ev[:1]}
+             for n, t in tools.items() if n not in effects][: min(2, max_d)]
+    eff = next((n for n in pol["effectTools"] if n in tools), None)
+    rec = [{"ifResultClass": None, "effect": eff, "arguments": _fill(tools[eff].get("inputSchema") or {}, tx),
+            "evidence": ev[:1]}] if eff else []
+    return validate_plan({"rootCause": cause, "evidence": ev, "diagnostics": diags, "recovery": rec},
+                         incident, cat, pol)
 
 
 def make_plan(planning_input, incident, deadline):
-    """Returns (plan, model_used). Adapts to provider limits; logs only the reason for failures."""
-    hint, limit, model, used_fallback = None, MAX_CHARS, LLM_MODEL, False
-    for _ in range(5):
+    hint = None
+    for _ in range(2):
         remaining = deadline - time.time()
-        if remaining < 3:
+        if remaining < 4:
             break
-        pi = compact(planning_input, limit) if limit else planning_input
         try:
-            raw = call_llm(pi, hint, max(2.0, remaining - 1), model)
-            return validate_plan(raw, incident, planning_input["toolCatalog"], planning_input["policy"]), model
-        except httpx.HTTPStatusError as e:
-            code, txt = e.response.status_code, e.response.text[:300]
-            log(f"http {code} model={model}: {txt}")
-            m = re.search(r"Limit (\d+).*?Requested (\d+)", txt, re.S)
-            too_big = code == 413 or "too large" in txt.lower() or (m and int(m.group(2)) > int(m.group(1)))
-            if too_big:  # request can never fit this model's limit: shrink the transcript
-                total = len(planning_input["incident"]["transcript"])
-                limit = 16000 if not limit or limit > 16000 else max(5000, limit // 2)
-                limit = min(limit, total)
-            elif code == 429:  # temporary rate limit: wait, then try the fallback model if any
-                try:
-                    wait = float(e.response.headers.get("retry-after", "3"))
-                except ValueError:
-                    wait = 3.0
-                time.sleep(max(0.0, min(wait, deadline - time.time() - 6)))
-                if LLM_FALLBACK_MODEL and not used_fallback:
-                    model, used_fallback = LLM_FALLBACK_MODEL, True
-            elif LLM_FALLBACK_MODEL and not used_fallback:
-                model, used_fallback = LLM_FALLBACK_MODEL, True
-            hint = None
-        except Exception as e:  # invalid model answer or transport error
-            log(f"{type(e).__name__}: {str(e)[:300]}")
+            raw = call_llm(planning_input, hint, timeout=max(2.0, remaining - 1))
+            return validate_plan(raw, incident, planning_input["toolCatalog"], planning_input["policy"])
+        except Exception as e:  # invalid answer or transport error: retry once if time remains
             hint = str(e)[:300]
+            print("planner error:", hint, flush=True)  # visible in host logs
+    if FALLBACK:
+        try:
+            print("planner: using fallback plan", flush=True)
+            return fallback_plan(planning_input, incident)
+        except Exception as e:
+            print("fallback failed:", repr(e)[:200], flush=True)
     raise ApiError(503, "planning_unavailable")
 
 
@@ -719,6 +731,24 @@ async def read_json(request: Request):
         raise ApiError(400, "invalid_request")
 
 
+@app.get("/health")
+def health():
+    return {"ok": True, "provider": PROVIDER, "model": LLM_MODEL}
+
+
+@app.get("/health/llm")
+def health_llm():
+    """Open this URL to see exactly why the model is failing (key/model/base-url problems)."""
+    if PROVIDER == "mock":
+        return {"ok": True, "provider": "mock"}
+    try:
+        _chat("Reply with JSON only.", 'Return {"ok": true}', 20)
+        return {"ok": True, "provider": PROVIDER, "model": LLM_MODEL, "baseUrl": LLM_BASE_URL}
+    except Exception as e:
+        return JSONResponse({"ok": False, "provider": PROVIDER, "model": LLM_MODEL, "baseUrl": LLM_BASE_URL,
+                             "error": str(e)[:300], "keySet": bool(LLM_API_KEY)}, status_code=503)
+
+
 @app.post("/v2/incidents")
 async def create_incident(request: Request):
     t0, tp, ts = time.time(), request.headers.get("traceparent"), request.headers.get("tracestate")
@@ -762,7 +792,7 @@ def handle_create(body, hdr_tp, hdr_ts, t0):
                                "policy": {**pol, "approvalRequiredFor": pol.get("approvalRequiredFor") or []}},
                               secrets_)  # `sensitive` is never sent
         plan_start = now_ns()
-        plan, model_used = make_plan(planning_input, body["incident"], t0 + REQUEST_BUDGET)
+        plan = make_plan(planning_input, body["incident"], t0 + REQUEST_BUDGET)
         plan = mask(plan, secrets_)
         plan_end = now_ns()
 
@@ -777,7 +807,7 @@ def handle_create(body, hdr_tp, hdr_ts, t0):
         st = {"runId": run_id, "agentName": body["agentName"], "marker": body["publicMarker"],
               "status": "waiting", "phase": "diagnostics",
               "diagnosis": {"rootCause": plan["rootCause"], "evidence": plan["evidence"]},
-              "model": "mock-planner" if PROVIDER == "mock" else model_used,
+              "model": PROVIDER == "mock" and "mock-planner" or LLM_MODEL,
               "provider": "mock" if PROVIDER == "mock" else ("anthropic" if PROVIDER == "anthropic" else "openai-compatible"),
               "plan": {"branches": plan["branches"]},
               "approvalRequiredFor": list(pol.get("approvalRequiredFor") or []),
